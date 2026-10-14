@@ -37,8 +37,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════
-BOT_TOKEN = "8634276478:AAHwetDC8vmm0MG8ekRmxXo7neMwZLl1yjg"
-ADMIN_IDS = {8353712042,7717877711}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 DB_PATH = os.getenv("DB_PATH", "esim_storex.db")
 LANGS = ("en", "ar")
 HTML = ParseMode.HTML
@@ -162,7 +162,7 @@ TRANSLATIONS = {
         "a_p_prod_img": "🖼️ Send the product image as a <b>photo</b> now.",
         "a_p_plan_add": "➕ Send the new plan in this format:\n\n<code>name EN | name AR | price in USDT</code>\n\nExample:\n<code>1 Month | شهر واحد | 1500</code>",
         "a_p_plan_edit": "✏️ Send the new value for <b>{field}</b>:",
-        "a_p_stock_add": "➕ Send QR-code images for <b>{item}</b>, one image per message. Each image is one eSIM. You can also send a photo as a document for higher quality. Your message is deleted after import.",
+        "a_p_stock_add": "➕ Bulk import QR stock for <b>{item}</b>: send multiple QR images together as a Telegram album, or quickly send many individual images. Each image becomes one eSIM. The bot imports the batch automatically after you stop sending images for a moment. You can also send images as documents for higher quality. Use /cancel to stop.",
         "a_p_stock_rm": "🗑️ Send the stock IDs to remove for <b>{item}</b> (e.g. <code>12 13 14</code>) or <code>all</code> to remove every AVAILABLE item.",
         "a_p_cfg": "✏️ Send the new value for <b>{label}</b>.{hint}\nSend <code>-</code> to clear it (not for numbers).",
         "a_p_cfgimg": "🖼️ Send the image for <b>{label}</b> as a photo.",
@@ -2037,6 +2037,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = cached_user(update.effective_user, context, refresh=True)
     context.user_data.pop("st", None)
+    batch = context.user_data.pop("_qr_stock_batch", None)
+    if batch and batch.get("task") and not batch["task"].done():
+        batch["task"].cancel()
     context.user_data.pop("proof_oid", None)
     for key in ("wallet_topup_currency", "wallet_topup_amount_dzd", "wallet_topup_amount_usd",
                 "wallet_topup_proof_id"):
@@ -2135,6 +2138,49 @@ async def handle_wallet_topup_amount(update, context, user):
     await send_view(msg.chat, v_wallet_funding_methods(lang, amount_dzd, amount_usd, currency))
 
 
+
+
+async def _finish_qr_stock_batch(context, chat_id, tg_id, al, plid):
+    """Wait until the admin finishes sending images, then import the entire batch at once."""
+    try:
+        await asyncio.sleep(2.5)
+        ud = context.application.user_data.get(tg_id, {})
+        key = "_qr_stock_batch"
+        batch = ud.get(key)
+        if not batch or batch.get("plid") != plid:
+            return
+        items = list(batch.get("items", []))
+        message_ids = list(batch.get("message_ids", []))
+        ud.pop(key, None)
+        st = ud.get("st")
+        if not items:
+            return
+        added, dup = add_stock(plid, items)
+        if st and st.get("k") == "stock_add" and st.get("plid") == plid:
+            ud.pop("st", None)
+        for mid in message_ids:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except TelegramError:
+                pass
+        lang = admin_lang(tg_id)
+        note = tr(lang, "a_stock_added", n=added, dup=tr(lang, "a_stock_dups", d=dup) if dup else "")
+        await context.bot.send_message(chat_id=chat_id, text=note, parse_mode=HTML)
+        text, markup, photo = av_stock(lang)
+        if photo:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=text, reply_markup=markup, parse_mode=HTML)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup, parse_mode=HTML)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("QR stock batch import failed")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ QR batch import failed. Please retry or send /cancel.")
+        except TelegramError:
+            pass
+
+
 async def admin_input(update, context, user, st):
     msg, al = update.effective_message, lang_of(user)
     T = lambda k, **kw: tr(al, k, **kw)
@@ -2193,26 +2239,29 @@ async def admin_input(update, context, user, st):
         ex(f"UPDATE plans SET {st['f']}=? WHERE id=?", (val, st["plid"]))
         await done(av_plan(al, st["plid"]), T("a_saved"))
     elif k == "stock_add":
-        # eSIM stock is stored as Telegram photo file IDs; one QR image = one item.
+        # Batch QR stock import: collect individual images/albums and flush after a short quiet period.
         if msg.photo:
             content = "QRPHOTO:" + msg.photo[-1].file_id
-            added, dup = add_stock(st["plid"], [content])
-            try:
-                await msg.delete()
-            except TelegramError:
-                pass
-            await done(av_stock(al), T("a_stock_added", n=added, dup=T("a_stock_dups", d=dup) if dup else ""))
-            return
-        if msg.document and (msg.document.mime_type or "").startswith("image/"):
+        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
             content = "QRPHOTO:" + msg.document.file_id
-            added, dup = add_stock(st["plid"], [content])
-            try:
-                await msg.delete()
-            except TelegramError:
-                pass
-            await done(av_stock(al), T("a_stock_added", n=added, dup=T("a_stock_dups", d=dup) if dup else ""))
-            return
-        return await bad()
+        else:
+            return await bad()
+
+        batch_key = "_qr_stock_batch"
+        batch = ud.setdefault(batch_key, {"plid": st["plid"], "items": [], "message_ids": [], "task": None})
+        if batch.get("plid") != st["plid"]:
+            old_task = batch.get("task")
+            if old_task and not old_task.done():
+                old_task.cancel()
+            batch = {"plid": st["plid"], "items": [], "message_ids": [], "task": None}
+            ud[batch_key] = batch
+        batch["items"].append(content)
+        batch["message_ids"].append(msg.message_id)
+        old_task = batch.get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        batch["task"] = asyncio.create_task(_finish_qr_stock_batch(context, chat.id, tg_id=user["telegram_id"], al=al, plid=st["plid"]))
+        return
     elif k == "stock_rm":
         with tx() as c:
             if text.lower() == "all":
