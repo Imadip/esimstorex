@@ -37,7 +37,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
 # ════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════
-BOT_TOKEN = "8634276478:AAHwetDC8vmm0MG8ekRmxXo7neMwZLl1yjg"
+BOT_TOKEN = "8634276478:AAGT9m4wuUKW__C4f3fMPfWKZEVXO7E1o-s"
 ADMIN_IDS = {8353712042,7717877711}
 DB_PATH = os.getenv("DB_PATH", "esim_storex.db")
 LANGS = ("en", "ar")
